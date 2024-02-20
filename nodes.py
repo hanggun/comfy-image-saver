@@ -139,6 +139,20 @@ class CheckpointSelector:
         return (ckpt_name,)
 
 
+class LoraSelector:
+    CATEGORY = 'ImageSaverTools/utils'
+    RETURN_TYPES = (folder_paths.get_filename_list("loras"),)
+    RETURN_NAMES = ("lora_name",)
+    FUNCTION = "get_names"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"lora_name": (folder_paths.get_filename_list("loras"), ),}}
+
+    def get_names(self, lora_name):
+        return (lora_name,)
+
+
 class SamplerSelector:
     CATEGORY = 'ImageSaverTools/utils'
     RETURN_TYPES = (comfy.samplers.KSampler.SAMPLERS,)
@@ -184,6 +198,7 @@ class ImageSaveWithMetadata:
                 "modelname": (folder_paths.get_filename_list("checkpoints"),),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+                "lora_name": (folder_paths.get_filename_list("loras"),),
             },
             "optional": {
                 "positive": ("STRING", {"default": 'unknown', "multiline": True}),
@@ -209,14 +224,16 @@ class ImageSaveWithMetadata:
 
     CATEGORY = "ImageSaverTools"
 
-    def save_files(self, images, seed_value, steps, cfg, sampler_name, scheduler, positive, negative, modelname, quality_jpeg_or_webp,
+    def save_files(self, images, seed_value, steps, cfg, sampler_name, scheduler, positive, negative, modelname, lora_name, quality_jpeg_or_webp,
                    lossless_webp, width, height, counter, filename, path, extension, time_format, prompt=None, extra_pnginfo=None):
         filename = make_filename(filename, seed_value, modelname, counter, time_format)
         path = make_pathname(path, seed_value, modelname, counter, time_format)
-        ckpt_path = folder_paths.get_full_path("checkpoints", modelname)
+        # ckpt_path = folder_paths.get_full_path("checkpoints", modelname)
         basemodelname = parse_name(modelname)
-        modelhash = calculate_sha256(ckpt_path)[:10]
-        comment = f"{handle_whitespace(positive)}\nNegative prompt: {handle_whitespace(negative)}\nSteps: {steps}, Sampler: {sampler_name}{f'_{scheduler}' if scheduler != 'normal' else ''}, CFG Scale: {cfg}, Seed: {seed_value}, Size: {width}x{height}, Model hash: {modelhash}, Model: {basemodelname}, Version: ComfyUI"
+        lora_name = parse_name(lora_name)
+        # modelhash = calculate_sha256(ckpt_path)[:10]
+        modelhash = '0'
+        comment = f"{handle_whitespace(positive)}\nNegative prompt: {handle_whitespace(negative)}\nSteps: {steps}, Sampler: {sampler_name}{f'_{scheduler}' if scheduler != 'normal' else ''}, CFG Scale: {cfg}, Seed: {seed_value}, Size: {width}x{height}, Model hash: {modelhash}, Model: {basemodelname}, Lora: {lora_name}, Version: ComfyUI"
         output_path = os.path.join(self.output_dir, path)
 
         if output_path.strip() != '':
@@ -249,7 +266,7 @@ class ImageSaveWithMetadata:
                         metadata.add_text(x, json.dumps(extra_pnginfo[x]))
 
                 filename = f"{filename_prefix}.png"
-                img.save(os.path.join(output_path, filename), pnginfo=metadata, optimize=True)
+                img.save(os.path.join(output_path, filename), pnginfo=metadata)
             else:
                 filename = f"{filename_prefix}.{extension}"
                 file = os.path.join(output_path, filename)
@@ -276,4 +293,5 @@ NODE_CLASS_MAPPINGS = {
     "Width/Height Literal": SizeLiteral,
     "Cfg Literal": CfgLiteral,
     "Int Literal": IntLiteral,
+    'Lora Selector': LoraSelector,
 }
