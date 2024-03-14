@@ -4,12 +4,14 @@ from datetime import datetime
 import json
 import piexif
 import piexif.helper
-from PIL import Image, ExifTags
+from PIL import Image, ExifTags, ImageOps, ImageSequence
 from PIL.PngImagePlugin import PngInfo
 import numpy as np
 import folder_paths
 import comfy.sd
 from nodes import MAX_RESOLUTION
+import torch
+from rembg import remove, new_session
 
 
 def parse_name(ckpt_name):
@@ -60,6 +62,66 @@ def make_filename(filename, seed, modelname, counter, time_format):
     return get_timestamp(time_format) if filename == "" else filename
 
 
+class LoadImageWithMetaData:
+    @classmethod
+    def INPUT_TYPES(s):
+        input_dir = folder_paths.get_input_directory()
+        files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+        return {"required":
+                    {"image": (sorted(files), {"image_upload": True})},
+                }
+
+    CATEGORY = "ImageSaverTools/utils"
+
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT")
+    RETURN_NAMES = ("IMAGE", "MASK", "width","height")
+    FUNCTION = "load_image_with_metadata"
+    def load_image_with_metadata(self, image):
+        image_path = folder_paths.get_annotated_filepath(image)
+        img = Image.open(image_path)
+        width, height = img.size
+        output_images = []
+        output_masks = []
+        for i in ImageSequence.Iterator(img):
+            i = ImageOps.exif_transpose(i)
+            if i.mode == 'I':
+                i = i.point(lambda i: i * (1 / 255))
+            image = i.convert("RGB")
+            image = np.array(image).astype(np.float32) / 255.0
+            image = torch.from_numpy(image)[None,]
+            if 'A' in i.getbands():
+                mask = np.array(i.getchannel('A')).astype(np.float32) / 255.0
+                mask = 1. - torch.from_numpy(mask)
+            else:
+                mask = torch.zeros((64,64), dtype=torch.float32, device="cpu")
+            output_images.append(image)
+            output_masks.append(mask.unsqueeze(0))
+
+        if len(output_images) > 1:
+            output_image = torch.cat(output_images, dim=0)
+            output_mask = torch.cat(output_masks, dim=0)
+        else:
+            output_image = output_images[0]
+            output_mask = output_masks[0]
+
+        return (output_image, output_mask, width, height)
+
+    @classmethod
+    def IS_CHANGED(s, image):
+        image_path = folder_paths.get_annotated_filepath(image)
+        m = hashlib.sha256()
+        with open(image_path, 'rb') as f:
+            m.update(f.read())
+        return m.digest().hex()
+
+    @classmethod
+    def VALIDATE_INPUTS(s, image):
+        if not folder_paths.exists_annotated_filepath(image):
+            return "Invalid image file: {}".format(image)
+
+        return True
+
+
 class SeedGenerator:
     RETURN_TYPES = ("INT",)
     FUNCTION = "get_seed"
@@ -87,6 +149,32 @@ class StringLiteral:
 
 
 class SizeLiteral:
+    RETURN_TYPES = ("INT",)
+    FUNCTION = "get_int"
+    CATEGORY = "ImageSaverTools/utils"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"int": ("INT", {"default": 512, "min": 1, "max": MAX_RESOLUTION, "step": 8})}}
+
+    def get_int(self, int):
+        return (int,)
+
+
+class WidthLiteral:
+    RETURN_TYPES = ("INT",)
+    FUNCTION = "get_int"
+    CATEGORY = "ImageSaverTools/utils"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"int": ("INT", {"default": 512, "min": 1, "max": MAX_RESOLUTION, "step": 8})}}
+
+    def get_int(self, int):
+        return (int,)
+
+
+class HeightLiteral:
     RETURN_TYPES = ("INT",)
     FUNCTION = "get_int"
     CATEGORY = "ImageSaverTools/utils"
@@ -133,6 +221,7 @@ class CheckpointSelector:
 
     @classmethod
     def INPUT_TYPES(cls):
+        cls.RETURN_TYPES = (folder_paths.get_filename_list("checkpoints"),)
         return {"required": {"ckpt_name": (folder_paths.get_filename_list("checkpoints"), ),}}
 
     def get_names(self, ckpt_name):
@@ -145,8 +234,13 @@ class LoraSelector:
     RETURN_NAMES = ("lora_name",)
     FUNCTION = "get_names"
 
+    # @classmethod
+    # def RETURN_TYPES(self):
+    #     return (folder_paths.get_filename_list("loras"),)
+
     @classmethod
     def INPUT_TYPES(cls):
+        cls.RETURN_TYPES = (folder_paths.get_filename_list("loras"),)
         return {"required": {"lora_name": (folder_paths.get_filename_list("loras"), ),}}
 
     def get_names(self, lora_name):
@@ -283,6 +377,26 @@ class ImageSaveWithMetadata:
         return paths
 
 
+class ImageRemBG:
+    session = new_session()
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "image": ("IMAGE",)}}
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "remove"
+
+    CATEGORY = "ImageSaverTools/utils"
+
+    def remove(self, image):
+        image_np = image.numpy()
+        pil_image = Image.fromarray((image_np * 255).astype(np.uint8)[0])
+        output = remove(pil_image, session=self.session)
+        output = np.array(output).astype(np.float32) / 255.0
+        s = torch.from_numpy(output)[None,]
+        return (s,)
+
+
 NODE_CLASS_MAPPINGS = {
     "Checkpoint Selector": CheckpointSelector,
     "Save Image w/Metadata": ImageSaveWithMetadata,
@@ -291,7 +405,11 @@ NODE_CLASS_MAPPINGS = {
     "Seed Generator": SeedGenerator,
     "String Literal": StringLiteral,
     "Width/Height Literal": SizeLiteral,
+    'Width Literal': WidthLiteral,
+    'Height Literal': HeightLiteral,
     "Cfg Literal": CfgLiteral,
     "Int Literal": IntLiteral,
     'Lora Selector': LoraSelector,
+    "Load Image with Metadata": LoadImageWithMetaData,
+    "Remove Background": ImageRemBG
 }
