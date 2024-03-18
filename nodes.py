@@ -187,6 +187,19 @@ class HeightLiteral:
         return (int,)
 
 
+class StepsLiteral:
+    RETURN_TYPES = ("INT",)
+    FUNCTION = "get_int"
+    CATEGORY = "ImageSaverTools/utils"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"int": ("INT", {"default": 20, "min": 1, "max": 100})}}
+
+    def get_int(self, int):
+        return (int,)
+
+
 class IntLiteral:
     RETURN_TYPES = ("INT",)
     FUNCTION = "get_int"
@@ -378,23 +391,32 @@ class ImageSaveWithMetadata:
 
 
 class ImageRemBG:
-    session = new_session()
+    session = None
 
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "image": ("IMAGE",)}}
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = ("IMAGE", "MASK", )
+    RETURN_NAMES = ("image", "mask", )
     FUNCTION = "remove"
 
     CATEGORY = "ImageSaverTools/utils"
 
     def remove(self, image):
+        session = self.get_session()
         image_np = image.numpy()
         pil_image = Image.fromarray((image_np * 255).astype(np.uint8)[0])
-        output = remove(pil_image, session=self.session)
-        output = np.array(output).astype(np.float32) / 255.0
+        image_cut = remove(pil_image, session=session)
+        output = np.array(image_cut.convert('RGB')).astype(np.float32) / 255.0
         s = torch.from_numpy(output)[None,]
-        return (s,)
+        mask = np.array(image_cut.getchannel('A')).astype(np.float32) / 255.0
+        mask = 1. - torch.from_numpy(mask)
+        return (s, mask, )
+
+    def get_session(self):
+        if not self.session:
+            self.session = new_session()
+        return self.session
 
 
 NODE_CLASS_MAPPINGS = {
@@ -407,6 +429,7 @@ NODE_CLASS_MAPPINGS = {
     "Width/Height Literal": SizeLiteral,
     'Width Literal': WidthLiteral,
     'Height Literal': HeightLiteral,
+    'Steps Literal': StepsLiteral,
     "Cfg Literal": CfgLiteral,
     "Int Literal": IntLiteral,
     'Lora Selector': LoraSelector,
