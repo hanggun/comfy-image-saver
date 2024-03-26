@@ -12,6 +12,8 @@ import comfy.sd
 from nodes import MAX_RESOLUTION
 import torch
 from rembg import remove, new_session
+import base64
+from io import BytesIO
 
 
 def parse_name(ckpt_name):
@@ -120,6 +122,48 @@ class LoadImageWithMetaData:
             return "Invalid image file: {}".format(image)
 
         return True
+
+
+class LoadImageBase64:
+    @classmethod
+    def INPUT_TYPES(s):
+        # input_dir = folder_paths.get_input_directory()
+        # files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+        return {
+            "required": {
+                "image_base64": (
+                    "STRING",
+                    {
+                        "multiline": False,  # True if you want the field to look like the one on the ClipTextEncode node
+                        "default": "",
+                    },
+                ),
+            }
+        }
+
+    CATEGORY = "ImageSaverTools/utils"
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    FUNCTION = "load_image_from_base64"
+
+    def load_image_from_base64(self, image_base64):
+        # Decode the base64 string
+        imgdata = base64.b64decode(image_base64)
+
+        # Open the image from memory
+        i = Image.open(BytesIO(imgdata))
+        i = ImageOps.exif_transpose(i)
+        image = i.convert("RGB")
+        image = np.array(image).astype(np.float32) / 255.0
+        image = torch.from_numpy(image)[None,]
+
+        if "A" in i.getbands():
+            mask = np.array(i.getchannel("A")).astype(np.float32) / 255.0
+            mask = 1.0 - torch.from_numpy(mask)
+        else:
+            mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
+
+        return (image, mask)
 
 
 class SeedGenerator:
@@ -419,6 +463,51 @@ class ImageRemBG:
         return self.session
 
 
+class GaussianLatentImage:
+    def __init__(self, device="cpu"):
+        # self.device = device
+        self.device = comfy.model_management.intermediate_device()
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "width": (
+                    "INT",
+                    {"default": 512, "min": 16, "max": 2048, "step": 1},
+                ),
+                "height": (
+                    "INT",
+                    {"default": 512, "min": 16, "max": 2048, "step": 1},
+                ),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "generate"
+
+    CATEGORY = "ImageSaverTools/utils"
+
+    def generate(self, width, height, batch_size=1, seed=0):
+        # Set the seed for reproducibility
+        torch.manual_seed(seed)
+
+        # Define the mean and standard deviation
+        mean = 0
+        var = 10
+        sigma = var**0.5
+
+        # Generate Gaussian noise
+        gaussian = torch.randn((batch_size, 4, height // 8, width // 8)) * sigma + mean
+
+        # Move the tensor to the specified device
+        latent = gaussian.float().to(self.device)
+
+        return ({"samples": latent},)
+
+
 NODE_CLASS_MAPPINGS = {
     "Checkpoint Selector": CheckpointSelector,
     "Save Image w/Metadata": ImageSaveWithMetadata,
@@ -434,5 +523,7 @@ NODE_CLASS_MAPPINGS = {
     "Int Literal": IntLiteral,
     'Lora Selector': LoraSelector,
     "Load Image with Metadata": LoadImageWithMetaData,
-    "Remove Background": ImageRemBG
+    "Remove Background": ImageRemBG,
+    "LoadImageBase64": LoadImageBase64,
+    'GaussianLatentImage': GaussianLatentImage
 }
