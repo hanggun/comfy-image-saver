@@ -4,7 +4,7 @@ from datetime import datetime
 import json
 import piexif
 import piexif.helper
-from PIL import Image, ExifTags, ImageOps, ImageSequence
+from PIL import Image, ExifTags, ImageOps, ImageSequence, ImageDraw, ImageFont
 from PIL.PngImagePlugin import PngInfo
 import numpy as np
 import folder_paths
@@ -14,6 +14,16 @@ import torch
 from rembg import remove, new_session
 import base64
 from io import BytesIO
+import math
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import matplotlib
+from torchvision.transforms import functional as TF
+import io
+import subprocess
+import time
+
+matplotlib.use("Agg")
 
 
 def parse_name(ckpt_name):
@@ -107,6 +117,72 @@ class LoadImageWithMetaData:
             output_mask = output_masks[0]
 
         return (output_image, output_mask, width, height)
+
+    @classmethod
+    def IS_CHANGED(s, image):
+        image_path = folder_paths.get_annotated_filepath(image)
+        m = hashlib.sha256()
+        with open(image_path, 'rb') as f:
+            m.update(f.read())
+        return m.digest().hex()
+
+    @classmethod
+    def VALIDATE_INPUTS(s, image):
+        if not folder_paths.exists_annotated_filepath(image):
+            return "Invalid image file: {}".format(image)
+
+        return True
+
+
+class LoadImageWithCoordinates:
+    @classmethod
+    def INPUT_TYPES(cls):
+        input_dir = folder_paths.get_input_directory()
+        files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+        return {"required":
+                {"image": (sorted(files), {"image_upload": True})},
+                }
+
+    CATEGORY = "ImageSaverTools/utils"
+
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT")
+    RETURN_NAMES = ("IMAGE", "MASK", "width", "height")
+    FUNCTION = "load_image_with_coordinates"
+
+    def load_image_with_coordinates(self, image):
+        image_path = folder_paths.get_annotated_filepath(image)
+        img = Image.open(image_path).convert('RGB')
+        width, height = img.size
+
+        # Create a matplotlib figure and axes
+        fig, ax = plt.subplots(figsize=(width / 100, height / 100))
+        ax.imshow(img, aspect='equal')
+
+        # Set no labels on axes
+        ax.axis('on')  # 'on' to turn on axis lines and labels, 'off' to turn off
+        ax.set_xticks(np.arange(0, width, 50))
+        ax.set_yticks(np.arange(0, height, 50))
+        ax.set_xticklabels([str(int(x)) for x in np.arange(0, width, 50)])
+        ax.set_yticklabels([str(int(y)) for y in np.arange(0, height, 50)])
+        ax.tick_params(axis='x', colors='red', direction='out', length=6, width=2)
+        ax.tick_params(axis='y', colors='red', direction='out', length=6, width=2)
+        ax.grid(True, which='both', linestyle='-', color='gray', linewidth=0.5)
+
+        # Save the plot to a buffer
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+
+        # Load image from buffer
+        img_with_coords = Image.open(buf).convert('RGB')
+        image = np.array(img_with_coords).astype(np.float32) / 255.0
+        img_tensor = torch.from_numpy(image)[None,]
+
+        # Create a dummy mask (since the original code expects a mask)
+        mask = torch.zeros(1, img_tensor.shape[1], img_tensor.shape[2], dtype=torch.float32)
+
+        return (img_tensor, mask, width, height)
 
     @classmethod
     def IS_CHANGED(s, image):
@@ -440,8 +516,8 @@ class ImageRemBG:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "image": ("IMAGE",)}}
-    RETURN_TYPES = ("IMAGE", "MASK", )
-    RETURN_NAMES = ("image", "mask", )
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", )
+    RETURN_NAMES = ("org_img", "image", "mask", )
     FUNCTION = "remove"
 
     CATEGORY = "ImageSaverTools/utils"
@@ -450,12 +526,14 @@ class ImageRemBG:
         session = self.get_session()
         image_np = image.numpy()
         pil_image = Image.fromarray((image_np * 255).astype(np.uint8)[0])
-        image_cut = remove(pil_image, session=session)
+        image_cut = remove(pil_image, session=session, bgcolor=(210,210,210,0))
+        image_cut_out = np.array(image_cut).astype(np.float32) / 255.0
+        image_cut_out = torch.from_numpy(image_cut_out)[None,]
         output = np.array(image_cut.convert('RGB')).astype(np.float32) / 255.0
         s = torch.from_numpy(output)[None,]
         mask = np.array(image_cut.getchannel('A')).astype(np.float32) / 255.0
         mask = 1. - torch.from_numpy(mask)
-        return (s, mask, )
+        return (image_cut_out, s, mask, )
 
     def get_session(self):
         if not self.session:
@@ -508,6 +586,269 @@ class GaussianLatentImage:
         return ({"samples": latent},)
 
 
+class GetImageResizeSize:
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "image": ("IMAGE",),
+                "pixel": (
+                    "INT",
+                    {"default": 512, "min": 16, "max": 2048, "step": 1},
+                )}}
+    RETURN_TYPES = ("INT", "INT", "INT", "INT", "INT", "INT")
+    RETURN_NAMES = ("width_scale", "height_scale", "smaller_side", "larger_side", "width", 'height')
+    FUNCTION = "get_size"
+
+    CATEGORY = "ImageSaverTools/utils"
+
+    def get_size(self, image, pixel):
+        image_np = image.numpy()
+        pil_image = Image.fromarray((image_np * 255).astype(np.uint8)[0])
+        width, height = pil_image.size
+        width_scale, height_scale = self.calculate_closest_dimensions((width, height), pixel)
+        width_1024, height_1024 = self.calculate_closest_dimensions((width, height), 1024)
+        if height_1024 > width_1024:
+            scale = width_1024 / width
+            height_1024 = int(height * scale)
+        else:
+            scale = height_1024 / height
+            width_1024 = int(width * scale)
+        print(width_scale, height_scale, width_1024, height_1024)
+        return (width_scale, height_scale, min(width_scale, height_scale), max(width_scale, height_scale), width_1024, height_1024, )
+
+    def calculate_closest_dimensions(self, target_ratio, fixed_pixel_value):
+        target_width, target_height = target_ratio
+        total_share = target_width * target_height
+
+        # 计算最接近的宽和高的像素值
+        closest_width = round((fixed_pixel_value**2 / total_share) ** 0.5 * target_width)
+        closest_height = round((fixed_pixel_value**2 / total_share) ** 0.5 * target_height)
+
+        # 确保宽和高均为 8 的倍数
+        closest_width = int(math.ceil(closest_width / 64) * 64)
+        closest_height = int(math.ceil(closest_height / 64) * 64)
+
+        return closest_width, closest_height
+
+
+class SamLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"ckpt_name": (folder_paths.get_filename_list("sams"), ),
+        "model_type": ("STRING", {"default": "vit_h"})}}
+    RETURN_TYPES = ("MODEL", )
+    FUNCTION = "load_checkpoint"
+
+    CATEGORY = "ImageSaverTools/utils"
+
+    def load_checkpoint(self, ckpt_name, model_type):
+        from segment_anything import sam_model_registry, SamPredictor
+        device = "cuda"
+        ckpt_path = folder_paths.get_full_path("sams", ckpt_name)
+        print(ckpt_path, 'loading sam')
+        sam = sam_model_registry[model_type](checkpoint=ckpt_path)
+        sam.to(device=device)
+        print('sam loaded')
+        predictor = SamPredictor(sam)
+        return (predictor, )
+
+
+class SamDetect:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"model": ('MODEL',),
+        "image": ('IMAGE', ),
+        "point_width": (
+                    "INT",
+                    {"default": 512, "min": 16, "max": 2048, "step": 1},
+                ),
+        "point_height": (
+                    "INT",
+                    {"default": 512, "min": 16, "max": 2048, "step": 1},
+                )}}
+    RETURN_TYPES = ("IMAGE", "MASK", )
+    RETURN_NAMES = ('image', "mask", )
+    FUNCTION = "sam_detect"
+
+    CATEGORY = "ImageSaverTools/utils"
+
+    def sam_detect(self, model, image, point_width, point_height):
+        image_np = image.numpy()
+        height, width = image.shape[1], image.shape[2]
+        image = (image_np * 255).astype(np.uint8)[0]
+        model.set_image(image)
+        input_point = np.array([[point_width, point_height]])
+        input_label = np.array([1])
+        masks, scores, logits = model.predict(
+            point_coords=input_point,
+            point_labels=input_label,
+            multimask_output=True,
+        )
+        new_masks = []
+        for mask, score in zip(masks, scores):
+            mask = self.show_mask(mask)
+            fig, ax = plt.subplots(figsize=(width/100, height/100))
+            ax.imshow(image)
+            ax.imshow(mask)
+            ax.set_title(str(score))
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight')
+            plt.close(fig)
+            buf.seek(0)
+            buf = Image.open(buf).convert('RGB')
+            buf = np.array(buf).astype(np.float32) / 255.0
+            new_masks.append(buf)
+        new_masks = np.stack(new_masks, axis=0)
+        new_masks = torch.from_numpy(new_masks)
+        return_mask = torch.from_numpy(masks[np.argmax(scores)])
+        return (new_masks, return_mask, )
+
+    def show_mask(self, mask, random_color=False):
+        if random_color:
+            color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+        else:
+            color = np.array([30/255, 144/255, 255/255, 0.6])
+        h, w = mask.shape[-2:]
+        mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+        return mask_image
+
+
+class BlipLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"ckpt_name": (folder_paths.get_filename_list("sams"), ),}}
+    RETURN_TYPES = ("MODEL", )
+    FUNCTION = "load_checkpoint"
+
+    CATEGORY = "ImageSaverTools/utils"
+
+    def load_checkpoint(self, ckpt_name):
+        from .blip.blip import BLIPCaptioner
+        model = BLIPCaptioner(device='cuda')
+        return (model, )
+
+
+class BlipCaption:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"model": ('MODEL',),
+                             "image": ('IMAGE',),
+                             'mask': ('MASK', )}}
+    RETURN_TYPES = ("STRING", )
+    FUNCTION = "main"
+
+    CATEGORY = "ImageSaverTools/utils"
+
+    def main(self, model, image, mask):
+        image_np = image.numpy()
+        image = (image_np * 255).astype(np.uint8)[0]
+        mask = mask.numpy()
+        print(mask.shape)
+        caption = model.inference_with_reduced_tokens(image, mask)
+        return (caption, )
+
+
+class LlavaCaption:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"image": ('IMAGE',),
+                             'mask': ('MASK', )}}
+    RETURN_TYPES = ("STRING", )
+    FUNCTION = "main"
+
+    CATEGORY = "ImageSaverTools/utils"
+
+    def main(self, image, mask):
+        image_np = image.numpy()
+        image = (image_np * 255).astype(np.uint8)[0]
+        mask = mask.numpy().astype(np.uint8)
+
+        crop_save_path = self.generate_crop_image(image, mask)
+        command = f"""CUDA_VISIBLE_DEVICES=1 /home/zxa/ps/llama_cpp/llava-cli -m /home/zxa/ps/pretrain_models/bunny/ggml-model-Q4_K_M.gguf --mmproj /home/zxa/ps/pretrain_models/bunny/mmproj-model-f16.gguf --image {crop_save_path} -c 4096 -p "Describe this image" --temp 0.0 -ngl 40 -n 2048"""
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        caption = result.stdout.strip()
+        return (caption, )
+
+    def generate_crop_image(self, image, seg_mask):
+        # image = np.array(image) * seg_mask[:, :, np.newaxis] + (1 - seg_mask[:, :, np.newaxis]) * 255
+        seg_mask = np.array(seg_mask) > 0
+        size = max(seg_mask.shape[0], seg_mask.shape[1])
+        top, bottom = self.boundary(seg_mask)
+        left, right = self.boundary(seg_mask.T)
+        box = [left / size, top / size, right / size, bottom / size]
+        size = max(image.shape[0], image.shape[1])
+        x1, y1, x2, y2 = box
+        image = Image.fromarray(image)
+        image_crop = np.array(image.crop((x1 * size, y1 * size, x2 * size, y2 * size)))
+        crop_save_path = f'/home/zxa/ps/http_deploy/generate_img/blip/result/crop_{time.time()}.png'
+        Image.fromarray(image_crop).save(crop_save_path)
+
+        print(f'crop save path {crop_save_path}')
+        return crop_save_path
+
+    def boundary(self, inputs):
+        col = inputs.shape[1]
+        inputs = inputs.reshape(-1)
+        lens = len(inputs)
+        start = np.argmax(inputs)
+        end = lens - 1 - np.argmax(np.flip(inputs))
+        top = start // col
+        bottom = end // col
+        return top, bottom
+
+
+class CenterTransparentImage:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"image": ('IMAGE',)}}
+    RETURN_TYPES = ("IMAGE", 'MASK')
+    FUNCTION = "main"
+
+    CATEGORY = "ImageSaverTools/utils"
+
+    def main(self, image):
+        image_np = image.numpy()
+        image = (image_np * 255).astype(np.uint8)[0]
+        image = Image.fromarray(image)
+        
+        # 获取图片尺寸
+        width, height = image.size
+        
+        # 计算缩放比例
+        scale = min(1024 / width, 1024 / height)
+        
+        # 调整图片尺寸
+        new_size = (int(width * scale), int(height * scale))
+        resized_image = image.resize(new_size, Image.LANCZOS)
+        
+        # 创建带透明度的白色背景
+        background = Image.new('RGBA', (1024, 1024), (128, 128, 128, 255))
+        
+        # 计算图片放置位置
+        offset = ((1024 - new_size[0]) // 2, (1024 - new_size[1]) // 2)
+        
+        # 创建mask图像
+        mask = Image.new('L', (1024, 1024), 0)
+        
+        # 获取原始图片的alpha通道，并按比例调整大小
+        alpha = resized_image.getchannel('A')
+        mask.paste(alpha, offset)
+        
+        # 将图片放置在背景中
+        background.paste(resized_image, offset, resized_image)
+        
+        background = background.convert('RGB')
+        output_image = np.array(background).astype(np.float32) / 255.0
+        output_image = torch.from_numpy(output_image)[None,]
+        
+        # 创建掩码图像
+        mask = np.array(mask).astype(np.float32) / 255.0
+        mask = torch.from_numpy(mask)[None, ...]
+
+        return (output_image, mask)
+
+
+
 NODE_CLASS_MAPPINGS = {
     "Checkpoint Selector": CheckpointSelector,
     "Save Image w/Metadata": ImageSaveWithMetadata,
@@ -523,7 +864,15 @@ NODE_CLASS_MAPPINGS = {
     "Int Literal": IntLiteral,
     'Lora Selector': LoraSelector,
     "Load Image with Metadata": LoadImageWithMetaData,
+    "Load Image with Cordinates": LoadImageWithCoordinates,
     "Remove Background": ImageRemBG,
     "LoadImageBase64": LoadImageBase64,
-    'GaussianLatentImage': GaussianLatentImage
+    'GaussianLatentImage': GaussianLatentImage,
+    'Get Image Scaled Size': GetImageResizeSize,
+    "Load Sam Checkpoint": SamLoader,
+    "Sam Detect": SamDetect,
+    "Load Blip": BlipLoader,
+    "Blip Caption": BlipCaption,
+    "Llava Caption": LlavaCaption,
+    "Center Transparent Image": CenterTransparentImage
 }
