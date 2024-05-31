@@ -800,54 +800,66 @@ class LlavaCaption:
 class CenterTransparentImage:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {"image": ('IMAGE',)}}
-    RETURN_TYPES = ("IMAGE", 'MASK')
+        return {"required": {"image": ('IMAGE',),
+                             "width": ("INT",{"default": 1024, "min": 16, "max": 2048, "step": 1},),
+                            "height": ("INT",{"default": 1024, "min": 16, "max": 2048, "step": 1},)}}
+    RETURN_TYPES = ("IMAGE", 'MASK', 'INT', 'INT', "INT")
+    RETURN_NAMES = ("IMAGE", 'MASK', 'width', 'height', 'larger_side')
     FUNCTION = "main"
 
     CATEGORY = "ImageSaverTools/utils"
 
-    def main(self, image):
+    def main(self, image, width, height):
+        canvas_width, canvas_height = width, height
         image_np = image.numpy()
         image = (image_np * 255).astype(np.uint8)[0]
         image = Image.fromarray(image)
-        
+
         # 获取图片尺寸
         width, height = image.size
-        
-        # 计算缩放比例
-        scale = min(1024 / width, 1024 / height)
-        
-        # 调整图片尺寸
-        new_size = (int(width * scale), int(height * scale))
-        resized_image = image.resize(new_size, Image.LANCZOS)
-        
-        # 创建带透明度的白色背景
-        background = Image.new('RGBA', (1024, 1024), (128, 128, 128, 255))
-        
+
+        # 创建带透明度的灰色背景
+        background = Image.new('RGBA', (canvas_width, canvas_height), (128, 128, 128, 255))
+
         # 计算图片放置位置
-        offset = ((1024 - new_size[0]) // 2, (1024 - new_size[1]) // 2)
-        
+        offset = ((canvas_width - width) // 2, (canvas_height - height) // 2)
+
+        # 获取原始图片的alpha通道
+        alpha = image.getchannel('A')
+
         # 创建mask图像
-        mask = Image.new('L', (1024, 1024), 0)
-        
-        # 获取原始图片的alpha通道，并按比例调整大小
-        alpha = resized_image.getchannel('A')
+        mask = Image.new('L', (canvas_width, canvas_height), 0)
         mask.paste(alpha, offset)
-        
+
         # 将图片放置在背景中
-        background.paste(resized_image, offset, resized_image)
-        
+        background.paste(image, offset, image)
+
+        # 转换为RGB并归一化
         background = background.convert('RGB')
         output_image = np.array(background).astype(np.float32) / 255.0
-        output_image = torch.from_numpy(output_image)[None,]
-        
+        output_image = torch.from_numpy(output_image)[None, ...]
+
         # 创建掩码图像
         mask = np.array(mask).astype(np.float32) / 255.0
         mask = torch.from_numpy(mask)[None, ...]
 
-        return (output_image, mask)
+        return (output_image, mask, canvas_width, canvas_height, max(canvas_width, canvas_height))
 
 
+class CompareInt:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"int1": ("INT", {"default": 1024, "min": 1, "max": 10000, "step": 1},),
+                             "int2": ("INT", {"default": 1024, "min": 1, "max": 10000, "step": 1},)}}
+
+    RETURN_TYPES = ('INT', 'INT')
+    RETURN_NAMES = ('larger', 'smaller')
+    FUNCTION = "main"
+
+    CATEGORY = "ImageSaverTools/utils"
+
+    def main(self, int1, int2):
+        return (max(int1, int2), min(int1, int2), )
 
 NODE_CLASS_MAPPINGS = {
     "Checkpoint Selector": CheckpointSelector,
@@ -874,5 +886,6 @@ NODE_CLASS_MAPPINGS = {
     "Load Blip": BlipLoader,
     "Blip Caption": BlipCaption,
     "Llava Caption": LlavaCaption,
-    "Center Transparent Image": CenterTransparentImage
+    "Center Transparent Image": CenterTransparentImage,
+    "Compare Int": CompareInt
 }
