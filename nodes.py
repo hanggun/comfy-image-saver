@@ -881,7 +881,7 @@ NODE_CLASS_MAPPINGS = {
     "LoadImageBase64": LoadImageBase64,
     'GaussianLatentImage': GaussianLatentImage,
     'Get Image Scaled Size': GetImageResizeSize,
-    "Load Sam Checkpoint": SamLoader,
+    # "Load Sam Checkpoint": SamLoader,
     "Sam Detect": SamDetect,
     "Load Blip": BlipLoader,
     "Blip Caption": BlipCaption,
